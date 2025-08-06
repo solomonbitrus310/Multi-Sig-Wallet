@@ -10,11 +10,17 @@
 (define-constant ERR-OWNER-EXISTS (err u109))
 (define-constant ERR-OWNER-NOT-FOUND (err u110))
 (define-constant ERR-TRANSACTION-EXPIRED (err u111))
+(define-constant ERR-TIMELOCK-ACTIVE (err u112))
+(define-constant ERR-INVALID-TIMELOCK (err u113))
+(define-constant ERR-TRANSACTION-CANCELLED (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var required-signatures uint u2)
 (define-data-var transaction-nonce uint u0)
 (define-data-var transaction-expiry-duration uint u144)
+(define-data-var default-timelock-delay uint u144)
+(define-data-var high-value-threshold uint u1000000)
+(define-data-var high-value-timelock-delay uint u288)
 
 (define-map owners
     principal
@@ -28,6 +34,8 @@
         executed: bool,
         signatures: uint,
         created-by: principal,
+        timelock-expires: uint,
+        cancelled: bool,
     }
 )
 (define-map transaction-signatures
@@ -72,6 +80,31 @@
 
 (define-read-only (get-wallet-balance)
     (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-timelock-settings)
+    {
+        default-delay: (var-get default-timelock-delay),
+        high-value-threshold: (var-get high-value-threshold),
+        high-value-delay: (var-get high-value-timelock-delay),
+    }
+)
+
+(define-read-only (is-timelock-expired (tx-id uint))
+    (match (get-transaction tx-id)
+        transaction (>= stacks-block-height (get timelock-expires transaction))
+        false
+    )
+)
+
+(define-read-only (get-timelock-remaining (tx-id uint))
+    (match (get-transaction tx-id)
+        transaction (if (>= stacks-block-height (get timelock-expires transaction))
+            u0
+            (- (get timelock-expires transaction) stacks-block-height)
+        )
+        u0
+    )
 )
 
 (define-read-only (count-owners)
@@ -153,7 +186,14 @@
         (to principal)
         (amount uint)
     )
-    (let ((tx-id (var-get transaction-nonce)))
+    (let (
+            (tx-id (var-get transaction-nonce))
+            (delay-blocks (if (>= amount (var-get high-value-threshold))
+                (var-get high-value-timelock-delay)
+                (var-get default-timelock-delay)
+            ))
+            (expires-at (+ stacks-block-height delay-blocks))
+        )
         (begin
             (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
             (asserts! (> amount u0) ERR-INVALID-AMOUNT)
@@ -167,6 +207,8 @@
                 executed: false,
                 signatures: u1,
                 created-by: tx-sender,
+                timelock-expires: expires-at,
+                cancelled: false,
             })
             (map-set transaction-signatures {
                 tx-id: tx-id,
@@ -209,6 +251,10 @@
             (asserts! (not (get executed transaction))
                 ERR-TRANSACTION-ALREADY-EXECUTED
             )
+            (asserts! (not (get cancelled transaction)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (>= stacks-block-height (get timelock-expires transaction))
+                ERR-TIMELOCK-ACTIVE
+            )
             (asserts!
                 (>= (get signatures transaction) (var-get required-signatures))
                 ERR-INSUFFICIENT-SIGNATURES
@@ -232,6 +278,7 @@
             (asserts! (not (get executed transaction))
                 ERR-TRANSACTION-ALREADY-EXECUTED
             )
+            (asserts! (not (get cancelled transaction)) ERR-TRANSACTION-CANCELLED)
             (asserts! (has-signed tx-id tx-sender) ERR-ALREADY-SIGNED)
             (map-delete transaction-signatures {
                 tx-id: tx-id,
@@ -242,6 +289,39 @@
             )
             (ok true)
         )
+    )
+)
+
+(define-public (cancel-transaction (tx-id uint))
+    (let ((transaction (unwrap! (get-transaction tx-id) ERR-TRANSACTION-NOT-FOUND)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get contract-owner))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts! (not (get executed transaction))
+                ERR-TRANSACTION-ALREADY-EXECUTED
+            )
+            (asserts! (not (get cancelled transaction)) ERR-TRANSACTION-CANCELLED)
+            (map-set transactions tx-id (merge transaction { cancelled: true }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-timelock-settings
+        (new-default-delay uint)
+        (new-high-value-threshold uint)
+        (new-high-value-delay uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-default-delay u0) ERR-INVALID-TIMELOCK)
+        (asserts! (> new-high-value-delay u0) ERR-INVALID-TIMELOCK)
+        (asserts! (> new-high-value-threshold u0) ERR-INVALID-TIMELOCK)
+        (var-set default-timelock-delay new-default-delay)
+        (var-set high-value-threshold new-high-value-threshold)
+        (var-set high-value-timelock-delay new-high-value-delay)
+        (ok true)
     )
 )
 
