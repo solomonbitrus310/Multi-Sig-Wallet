@@ -13,6 +13,10 @@
 (define-constant ERR-TIMELOCK-ACTIVE (err u112))
 (define-constant ERR-INVALID-TIMELOCK (err u113))
 (define-constant ERR-TRANSACTION-CANCELLED (err u114))
+(define-constant ERR-BATCH-NOT-FOUND (err u115))
+(define-constant ERR-BATCH-ALREADY-EXECUTED (err u116))
+(define-constant ERR-EMPTY-BATCH (err u117))
+(define-constant ERR-BATCH-TOO-LARGE (err u118))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var required-signatures uint u2)
@@ -21,6 +25,8 @@
 (define-data-var default-timelock-delay uint u144)
 (define-data-var high-value-threshold uint u1000000)
 (define-data-var high-value-timelock-delay uint u288)
+(define-data-var batch-nonce uint u0)
+(define-data-var max-batch-size uint u10)
 
 (define-map owners
     principal
@@ -45,6 +51,25 @@
     }
     bool
 )
+(define-map batches
+    uint
+    {
+        transaction-ids: (list 10 uint),
+        total-amount: uint,
+        executed: bool,
+        signatures: uint,
+        created-by: principal,
+        timelock-expires: uint,
+        cancelled: bool,
+    }
+)
+(define-map batch-signatures
+    {
+        batch-id: uint,
+        signer: principal,
+    }
+    bool
+)
 
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
@@ -56,6 +81,30 @@
 
 (define-read-only (get-transaction-nonce)
     (var-get transaction-nonce)
+)
+
+(define-read-only (get-batch-nonce)
+    (var-get batch-nonce)
+)
+
+(define-read-only (get-batch (batch-id uint))
+    (map-get? batches batch-id)
+)
+
+(define-read-only (has-signed-batch
+        (batch-id uint)
+        (signer principal)
+    )
+    (default-to false
+        (map-get? batch-signatures {
+            batch-id: batch-id,
+            signer: signer,
+        })
+    )
+)
+
+(define-read-only (get-max-batch-size)
+    (var-get max-batch-size)
 )
 
 (define-read-only (is-owner (user principal))
@@ -322,6 +371,108 @@
         (var-set high-value-threshold new-high-value-threshold)
         (var-set high-value-timelock-delay new-high-value-delay)
         (ok true)
+    )
+)
+
+(define-public (propose-batch
+        (recipients (list 10 principal))
+        (amounts (list 10 uint))
+    )
+    (let (
+            (batch-id (var-get batch-nonce))
+            (recipients-len (len recipients))
+            (amounts-len (len amounts))
+            (total-amount (fold + amounts u0))
+            (delay-blocks (if (>= total-amount (var-get high-value-threshold))
+                (var-get high-value-timelock-delay)
+                (var-get default-timelock-delay)
+            ))
+            (expires-at (+ stacks-block-height delay-blocks))
+        )
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (is-eq recipients-len amounts-len) ERR-INVALID-AMOUNT)
+            (asserts!
+                (and (> recipients-len u0) (<= recipients-len (var-get max-batch-size)))
+                ERR-BATCH-TOO-LARGE
+            )
+            (asserts! (>= (get-wallet-balance) total-amount) ERR-WALLET-EMPTY)
+            (map-set batches batch-id {
+                transaction-ids: (list),
+                total-amount: total-amount,
+                executed: false,
+                signatures: u1,
+                created-by: tx-sender,
+                timelock-expires: expires-at,
+                cancelled: false,
+            })
+            (map-set batch-signatures {
+                batch-id: batch-id,
+                signer: tx-sender,
+            }
+                true
+            )
+            (var-set batch-nonce (+ batch-id u1))
+            (ok batch-id)
+        )
+    )
+)
+
+(define-public (sign-batch (batch-id uint))
+    (let ((batch (unwrap! (get-batch batch-id) ERR-BATCH-NOT-FOUND)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed batch)) ERR-BATCH-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled batch)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (not (has-signed-batch batch-id tx-sender))
+                ERR-ALREADY-SIGNED
+            )
+            (map-set batch-signatures {
+                batch-id: batch-id,
+                signer: tx-sender,
+            }
+                true
+            )
+            (map-set batches batch-id
+                (merge batch { signatures: (+ (get signatures batch) u1) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (execute-batch (batch-id uint))
+    (let ((batch (unwrap! (get-batch batch-id) ERR-BATCH-NOT-FOUND)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed batch)) ERR-BATCH-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled batch)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (>= stacks-block-height (get timelock-expires batch))
+                ERR-TIMELOCK-ACTIVE
+            )
+            (asserts! (>= (get signatures batch) (var-get required-signatures))
+                ERR-INSUFFICIENT-SIGNATURES
+            )
+            (asserts! (>= (get-wallet-balance) (get total-amount batch))
+                ERR-WALLET-EMPTY
+            )
+            (map-set batches batch-id (merge batch { executed: true }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (cancel-batch (batch-id uint))
+    (let ((batch (unwrap! (get-batch batch-id) ERR-BATCH-NOT-FOUND)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get contract-owner))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts! (not (get executed batch)) ERR-BATCH-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled batch)) ERR-TRANSACTION-CANCELLED)
+            (map-set batches batch-id (merge batch { cancelled: true }))
+            (ok true)
+        )
     )
 )
 
