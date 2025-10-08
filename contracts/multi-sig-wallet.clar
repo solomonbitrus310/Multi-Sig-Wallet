@@ -17,6 +17,9 @@
 (define-constant ERR-BATCH-ALREADY-EXECUTED (err u116))
 (define-constant ERR-EMPTY-BATCH (err u117))
 (define-constant ERR-BATCH-TOO-LARGE (err u118))
+(define-constant ERR-INSUFFICIENT-ALLOWANCE (err u119))
+(define-constant ERR-ALLOWANCE-NOT-ENABLED (err u120))
+(define-constant ERR-INVALID-ALLOWANCE (err u121))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var required-signatures uint u2)
@@ -27,6 +30,8 @@
 (define-data-var high-value-timelock-delay uint u288)
 (define-data-var batch-nonce uint u0)
 (define-data-var max-batch-size uint u10)
+(define-data-var allowance-enabled bool false)
+(define-data-var allowance-refill-period uint u1440)
 
 (define-map owners
     principal
@@ -70,6 +75,14 @@
     }
     bool
 )
+(define-map owner-allowances
+    principal
+    {
+        limit: uint,
+        spent: uint,
+        last-refill: uint,
+    }
+)
 
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
@@ -105,6 +118,33 @@
 
 (define-read-only (get-max-batch-size)
     (var-get max-batch-size)
+)
+
+(define-read-only (get-allowance-enabled)
+    (var-get allowance-enabled)
+)
+
+(define-read-only (get-allowance-refill-period)
+    (var-get allowance-refill-period)
+)
+
+(define-read-only (get-owner-allowance (owner principal))
+    (map-get? owner-allowances owner)
+)
+
+(define-read-only (get-available-allowance (owner principal))
+    (match (map-get? owner-allowances owner)
+        allowance (let (
+                (blocks-since-refill (- stacks-block-height (get last-refill allowance)))
+                (refill-period (var-get allowance-refill-period))
+            )
+            (if (>= blocks-since-refill refill-period)
+                (get limit allowance)
+                (- (get limit allowance) (get spent allowance))
+            )
+        )
+        u0
+    )
 )
 
 (define-read-only (is-owner (user principal))
@@ -471,6 +511,102 @@
             (asserts! (not (get executed batch)) ERR-BATCH-ALREADY-EXECUTED)
             (asserts! (not (get cancelled batch)) ERR-TRANSACTION-CANCELLED)
             (map-set batches batch-id (merge batch { cancelled: true }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (set-owner-allowance
+        (owner principal)
+        (limit uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-owner owner) ERR-OWNER-NOT-FOUND)
+        (asserts! (> limit u0) ERR-INVALID-ALLOWANCE)
+        (map-set owner-allowances owner {
+            limit: limit,
+            spent: u0,
+            last-refill: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (remove-owner-allowance (owner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (map-delete owner-allowances owner)
+        (ok true)
+    )
+)
+
+(define-public (toggle-allowance-system (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set allowance-enabled enabled)
+        (ok true)
+    )
+)
+
+(define-public (set-allowance-refill-period (blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> blocks u0) ERR-INVALID-ALLOWANCE)
+        (var-set allowance-refill-period blocks)
+        (ok true)
+    )
+)
+
+(define-public (spend-from-allowance
+        (to principal)
+        (amount uint)
+    )
+    (let (
+            (allowance (unwrap! (map-get? owner-allowances tx-sender)
+                ERR-ALLOWANCE-NOT-ENABLED
+            ))
+            (blocks-since-refill (- stacks-block-height (get last-refill allowance)))
+            (refill-period (var-get allowance-refill-period))
+            (should-refill (>= blocks-since-refill refill-period))
+            (current-spent (if should-refill
+                u0
+                (get spent allowance)
+            ))
+            (available (- (get limit allowance) current-spent))
+        )
+        (begin
+            (asserts! (var-get allowance-enabled) ERR-ALLOWANCE-NOT-ENABLED)
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+            (asserts! (not (is-eq to (as-contract tx-sender)))
+                ERR-INVALID-RECIPIENT
+            )
+            (asserts! (>= available amount) ERR-INSUFFICIENT-ALLOWANCE)
+            (asserts! (>= (get-wallet-balance) amount) ERR-WALLET-EMPTY)
+            (try! (as-contract (stx-transfer? amount tx-sender to)))
+            (map-set owner-allowances tx-sender {
+                limit: (get limit allowance),
+                spent: (+ current-spent amount),
+                last-refill: (if should-refill
+                    stacks-block-height
+                    (get last-refill allowance)
+                ),
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (refill-allowance (owner principal))
+    (let ((allowance (unwrap! (map-get? owner-allowances owner) ERR-ALLOWANCE-NOT-ENABLED)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (map-set owner-allowances owner {
+                limit: (get limit allowance),
+                spent: u0,
+                last-refill: stacks-block-height,
+            })
             (ok true)
         )
     )
