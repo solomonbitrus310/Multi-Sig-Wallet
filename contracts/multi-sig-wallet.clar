@@ -20,6 +20,9 @@
 (define-constant ERR-INSUFFICIENT-ALLOWANCE (err u119))
 (define-constant ERR-ALLOWANCE-NOT-ENABLED (err u120))
 (define-constant ERR-INVALID-ALLOWANCE (err u121))
+(
+define-constant ERR-OWNER-CHANGE-NOT-FOUND (err u122))
+(define-constant ERR-OWNER-CHANGE-ALREADY-EXECUTED (err u123))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var required-signatures uint u2)
@@ -29,6 +32,7 @@
 (define-data-var high-value-threshold uint u1000000)
 (define-data-var high-value-timelock-delay uint u288)
 (define-data-var batch-nonce uint u0)
+(define-data-var owner-change-nonce uint u0)
 (define-data-var max-batch-size uint u10)
 (define-data-var allowance-enabled bool false)
 (define-data-var allowance-refill-period uint u1440)
@@ -75,6 +79,24 @@
     }
     bool
 )
+(define-map owner-change-proposals
+    uint
+    {
+        old-owner: principal,
+        new-owner: principal,
+        executed: bool,
+        signatures: uint,
+        created-by: principal,
+        cancelled: bool,
+    }
+)
+(define-map owner-change-signatures
+    {
+        proposal-id: uint,
+        signer: principal,
+    }
+    bool
+)
 (define-map owner-allowances
     principal
     {
@@ -111,6 +133,25 @@
     (default-to false
         (map-get? batch-signatures {
             batch-id: batch-id,
+            signer: signer,
+        })
+    )
+)
+(define-read-only (get-owner-change-nonce)
+    (var-get owner-change-nonce)
+)
+
+(define-read-only (get-owner-change (proposal-id uint))
+    (map-get? owner-change-proposals proposal-id)
+)
+
+(define-read-only (has-signed-owner-change
+        (proposal-id uint)
+        (signer principal)
+    )
+    (default-to false
+        (map-get? owner-change-signatures {
+            proposal-id: proposal-id,
             signer: signer,
         })
     )
@@ -511,6 +552,106 @@
             (asserts! (not (get executed batch)) ERR-BATCH-ALREADY-EXECUTED)
             (asserts! (not (get cancelled batch)) ERR-TRANSACTION-CANCELLED)
             (map-set batches batch-id (merge batch { cancelled: true }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (propose-owner-change
+        (old-owner principal)
+        (new-owner principal)
+    )
+    (let ((proposal-id (var-get owner-change-nonce)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (is-owner old-owner) ERR-OWNER-NOT-FOUND)
+            (asserts! (not (is-owner new-owner)) ERR-OWNER-EXISTS)
+            (map-set owner-change-proposals proposal-id {
+                old-owner: old-owner,
+                new-owner: new-owner,
+                executed: false,
+                signatures: u1,
+                created-by: tx-sender,
+                cancelled: false,
+            })
+            (map-set owner-change-signatures {
+                proposal-id: proposal-id,
+                signer: tx-sender,
+            }
+                true
+            )
+            (var-set owner-change-nonce (+ proposal-id u1))
+            (ok proposal-id)
+        )
+    )
+)
+
+(define-public (sign-owner-change (proposal-id uint))
+    (let ((proposal (unwrap! (get-owner-change proposal-id) ERR-OWNER-CHANGE-NOT-FOUND)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed proposal)) ERR-OWNER-CHANGE-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled proposal)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (not (has-signed-owner-change proposal-id tx-sender)) ERR-ALREADY-SIGNED)
+            (map-set owner-change-signatures {
+                proposal-id: proposal-id,
+                signer: tx-sender,
+            }
+                true
+            )
+            (map-set owner-change-proposals proposal-id
+                (merge proposal { signatures: (+ (get signatures proposal) u1) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (revoke-owner-change-signature (proposal-id uint))
+    (let ((proposal (unwrap! (get-owner-change proposal-id) ERR-OWNER-CHANGE-NOT-FOUND)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed proposal)) ERR-OWNER-CHANGE-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled proposal)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (has-signed-owner-change proposal-id tx-sender) ERR-ALREADY-SIGNED)
+            (map-delete owner-change-signatures {
+                proposal-id: proposal-id,
+                signer: tx-sender,
+            })
+            (map-set owner-change-proposals proposal-id
+                (merge proposal { signatures: (- (get signatures proposal) u1) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (execute-owner-change (proposal-id uint))
+    (let ((proposal (unwrap! (get-owner-change proposal-id) ERR-OWNER-CHANGE-NOT-FOUND)))
+        (begin
+            (asserts! (is-owner tx-sender) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed proposal)) ERR-OWNER-CHANGE-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled proposal)) ERR-TRANSACTION-CANCELLED)
+            (asserts! (>= (get signatures proposal) (var-get required-signatures))
+                ERR-INSUFFICIENT-SIGNATURES
+            )
+            (asserts! (is-owner (get old-owner proposal)) ERR-OWNER-NOT-FOUND)
+            (asserts! (not (is-owner (get new-owner proposal))) ERR-OWNER-EXISTS)
+            (map-delete owners (get old-owner proposal))
+            (map-set owners (get new-owner proposal) true)
+            (map-set owner-change-proposals proposal-id (merge proposal { executed: true }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (cancel-owner-change (proposal-id uint))
+    (let ((proposal (unwrap! (get-owner-change proposal-id) ERR-OWNER-CHANGE-NOT-FOUND)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+            (asserts! (not (get executed proposal)) ERR-OWNER-CHANGE-ALREADY-EXECUTED)
+            (asserts! (not (get cancelled proposal)) ERR-TRANSACTION-CANCELLED)
+            (map-set owner-change-proposals proposal-id (merge proposal { cancelled: true }))
             (ok true)
         )
     )
